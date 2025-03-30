@@ -1,0 +1,127 @@
+---
+- name: Configure common requirements
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install common packages
+      apt:
+        name:
+          - openssh-server
+          - curl
+          - sudo
+        state: present
+        update_cache: yes
+
+    - name: Ensure SSH is running
+      service:
+        name: ssh
+        state: started
+        enabled: yes
+
+- name: Setup RKE2 control plane
+  hosts: rke2_servers
+  become: yes
+  tasks:
+    - name: Install RKE2 server
+      shell: curl -sfL https://get.rke2.io | INSTALL_RKE2_CHANNEL=stable sh -
+
+    - name: Enable and start RKE2 server
+      systemd:
+        name: rke2-server
+        enabled: yes
+        state: started
+
+    - name: Get node token
+      shell: cat /var/lib/rancher/rke2/server/node-token
+      register: rke2_token
+      changed_when: false
+
+    - name: Store token for agents
+      copy:
+        content: "{{ rke2_token.stdout }}"
+        dest: /tmp/rke2_token.txt
+
+    - name: Configure kubectl access
+      block:
+        - name: Wait for kubeconfig to be generated
+          wait_for:
+            path: /etc/rancher/rke2/rke2.yaml
+            timeout: 120
+
+        - name: Copy kubeconfig locally
+          fetch:
+            src: /etc/rancher/rke2/rke2.yaml
+            dest: /tmp/rke2.yaml
+            flat: yes
+
+        - name: Update kubeconfig with correct server IP
+          replace:
+            path: /tmp/rke2.yaml
+            regexp: '127.0.0.1:6443'
+            replace: "{{ ansible_host }}:6443"
+
+- name: Join RKE2 agents
+  hosts: rke2_agents
+  become: yes
+  tasks:
+    - name: Retrieve server token
+      slurp:
+        src: /tmp/rke2_token.txt
+      register: token_file
+      delegate_to: cp01
+
+    - name: Install RKE2 agent
+      shell: curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
+
+    - name: Configure RKE2 agent
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        content: |
+          server: https://{{ hostvars['cp01'].ansible_host }}:9345
+          token: {{ token_file.content | b64decode }}
+
+    - name: Enable and start RKE2 agent
+      systemd:
+        name: rke2-agent
+        enabled: yes
+        state: started
+
+- name: Deploy Rancher
+  hosts: management
+  become: yes
+  tasks:
+    - name: Install Docker
+      apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: Start Rancher container
+      docker_container:
+        name: rancher
+        image: rancher/rancher:latest
+        restart_policy: unless-stopped
+        ports:
+          - "80:80"
+          - "443:443"
+        volumes:
+          - rancher_data:/var/lib/rancher
+
+    - name: Wait for Rancher to be ready
+      uri:
+        url: "https://localhost"
+        validate_certs: no
+        status_code: 200
+      register: rancher_ready
+      until: rancher_ready.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: yes
