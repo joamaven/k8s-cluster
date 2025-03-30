@@ -34,7 +34,7 @@ ssh julius@192.168.1.159
 sudo apt update && sudo apt install -y ansible git
 
 # Clone this repository
-git clone https://github.com/your-repo/k8s-cluster.git
+git clone https://github.com/joamaven/k8s-cluster.git
 cd k8s-cluster
 ```
 
